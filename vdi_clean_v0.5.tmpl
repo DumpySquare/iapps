@@ -1,0 +1,556 @@
+sys application template /Common/vdi_clean_v0.5 {
+    actions {
+        definition {
+            html-help {
+            }
+            implementation {
+                package require iapp 1.0.0
+tmsh::include f5.iapp.1.5.2.cli
+iapp_template start
+
+#################################################################
+#################################################################
+########  beginning of apm_map  #################################
+
+array set apm_map {
+default {
+        <PROFILE_TYPE> {apm profile access}
+        <GROUP_DEF> {type logout }
+        <PROFILE_DEF> "accept-languages replace-all-with { en }
+            access-policy <ITEM>
+            defaults-from /Common/access
+            customization-group <ITEM>_logout
+            eps-group <ITEM>_eps
+            errormap-group <ITEM>_errormap
+            domain-cookie <DOMAIN>
+            framework-installation-group <ITEM>_frameworkinstallation
+            general-ui-group <ITEM>_general_ui
+            # assign sso form created below
+            sso-name <ITEM>_sso_form_based
+            logout-uri-include <LOGOUT_URI>
+            logout-uri-timeout 1
+            <LOG_SETTINGS>" }
+ent {
+        <ITEM_AGENT> {}
+        <ITEM_CAPTION> {"Start"}
+        <ITEM_TYPE> {}
+        <RULE_NEXT_0> act_saml_auth  }
+act_saml_auth {
+        <AGENT_TYPE> aaa-saml
+        <AGENT_DEF> "server <SAML_SP>"
+        <ITEM_CAPTION> {"SAML Auth"}
+        <RULE_EXPR_1> {"expr {[mcget {session.saml.last.result}] == 1}"}
+        <RULE_NEXT_1> variable_assign
+        <RULE_NEXT_0> end_deny  }
+variable_assign {
+        <AGENT_TYPE> variable-assign
+        <AGENT_DEF> "variables {{
+            expression \"mcget {session.saml.last.nameIDValue}\"
+            varname session.logon.last.username }{
+            expression \"mcget {session.saml.last.attr.name.pw}\"
+            secure true varname session.logon.last.password }}"
+        <ITEM_CAPTION> {"Session Variable Assign"}
+        <RULE_NEXT_0> sso_credential_mapping  }
+sso_credential_mapping {
+        <AGENT_TYPE> variable-assign
+        <AGENT_DEF> "type sso-cred-mapping
+            variables {{
+            expression \"mcget {session.logon.last.username}\"
+            varname session.sso.token.last.username }{
+            expression \"mcget {session.logon.last.password}\"
+            varname session.sso.token.last.password }}"
+        <ITEM_CAPTION> {"SSO Credential Mapping"}
+        <RULE_NEXT_0> end_allow  }
+end_allow {
+        <AGENT_DEF> {}
+        <AGENT_TYPE> ending-allow
+        <ITEM_CAPTION> {"Allow"}
+        <ITEM_TYPE> {item-type ending}
+        <ITEM_RULES> {}  }
+end_redirect {
+        <AGENT_DEF> "close-session false
+                     url \"https://%{session.server.network.name}<CUSTOM_URI>\""
+        <AGENT_TYPE> ending-redirect
+        <ITEM_CAPTION> {"Allow and Redirect"}
+        <ITEM_TYPE> {item-type ending}
+        <ITEM_RULES> {}  }
+connect {
+        <PROFILE_TYPE> {apm profile connectivity}
+        <GROUP_DEF> {type secure-access-client }
+        <PROFILE_DEF> "customization-group <ITEM>
+                       citrix-client-bundle <CLIENT_BUNDLE>
+                       defaults-from /Common/connectivity"  }
+end_deny {
+        <ACCESS_START_ITEM> <PREFIX>_ent
+        <ACCESS_ENDING> <PREFIX>_end_deny
+        <AGENT_TYPE> ending-deny
+        <GROUP_DEF> {type logout }
+        <ITEM_CAPTION> {"Deny"}
+        <ITEM_TYPE> {item-type ending}
+        <ITEM_COLOR> {2}
+        <ITEM_RULES> {}  }
+sso_form_based {
+        <PROFILE_TYPE> {apm sso form-based}
+        <PROFILE_DEF>  "passthru true
+            form-action <CUSTOM_URI><FORM_ACTION_DIR>/LoginAttempt
+            form-field \"LoginBtn Log+On\nStateContext \"
+            form-password password
+            form-username username
+            start-uri <CUSTOM_URI><START_URI_DIR>/Login*
+            success-match-type cookie
+            success-match-value CtxsAuthId"  }
+}
+
+##################  End apm_map ##############################
+##############################################################
+##############################################################
+
+
+# assign app name that user typed in as a variable
+set app $tmsh::app_name
+# set ciphers requested by vdi team to get best score from some ssl test website
+# todo: expose cipher list in presentation or just confirm it doesn't need to be updated
+set ciphers "!EXPORT:!SSLv3:!TLSv1:!TLSv1_1:!EDH:!3DES:ECDHE+AES-GCM:ECDHE+AES:ECDHE+RSA:RSA+AES-GCM:RSA+AES"
+
+#set partition "Common"
+#set aso "/$partition/${app}.app/$app"
+#set app_service "${app}.app/${app}"
+
+set app             $tmsh::app_name
+set uri             $::main__sf_uri
+set is_admin        [iapp_get_user -is_admin]
+set tmos_v          [iapp_tmos_version]
+set is_v12_0        [iapp_tmos_version >= 12.0]
+set is_v14_0        [iapp_tmos_version >= 14.0]
+set is_v14_1        [iapp_tmos_version >= 14.1]
+
+
+# set apm_map prefix to iapp name
+set apm_map(prefix) [tmsh::pwd]/$app
+
+## all "puts" statements log iapp execution stuff to /var/tmp/scriptd.out
+#puts "Executing ${app} iApp intouch - ${cdate}"
+## tmsh::log statements log to /var/log/ltm
+#tmsh::log "Executing ${app} iApp intouch - ${cdate}"
+
+# create http profile
+set http_profile [iapp_conf create ltm profile http ${app}_http \
+    defaults-from /Common/http \
+    header-erase Accept-Encoding \
+    insert-xforwarded-for enabled \
+    proxy-type reverse \
+    redirect-rewrite matching ]
+
+#create client side wan optimized tcp
+set wan_tcp [iapp::conf create ltm profile tcp ${app}_wan_optimized_tcp \
+    defaults-from /Common/tcp-wan-optimized \
+    idle-timeout 1800 \
+    keep-alive-interval 75 \
+    nagle disabled \
+    pkt-loss-ignore-burst 8 \
+    pkt-loss-ignore-rate 10000 \
+    proxy-buffer-low 65536 \
+    receive-window-size 1048576 \
+    selective-nack enabled \
+    send-buffer-size 1048576 \
+    syn-rto-base 200 ]
+
+# create server side optimized lan tcp
+set lan_tcp [iapp::conf create ltm profile tcp ${app}_lan_optimized_tcp \
+    defaults-from /Common/tcp-lan-optimized \
+    idle-timeout 1800 ]
+
+# creating clientssl profile in v14 requires cipher rules/groups for TLS1.3
+if { $is_v14_0 } {
+    # create cipher rule and group for clientssl
+    set cipher_rule [iapp::conf create ltm cipher rule ${app}_cipher_rule cipher $ciphers ]
+    set cipher_group [iapp::conf create ltm cipher group ${app}_cipher_group allow replace-all-with \{ $cipher_rule \}]
+
+    # Not able to associate the cipher list directly since it allows TLS1.3
+    # -- has to be done through a cipher group, see articles: K75675154, K65292843
+    # create clientssl profile
+    set clientssl [iapp::conf create ltm profile client-ssl ${app}_clientssl \
+        defaults-from /Common/clientssl \
+        options \{ dont-insert-empty-fragments single-dh-use \} \
+        ciphers none \
+        cipher-group $cipher_group \
+        cert-key-chain replace-all-with \{ default \{ \
+            cert $::main__cert key $::main__key chain $::main__cert_chain \} \}]
+} else {
+    set clientssl [iapp::conf create ltm profile client-ssl ${app}_clientssl \
+        defaults-from /Common/clientssl \
+        options \{ dont-insert-empty-fragments single-dh-use \} \
+        ciphers $ciphers \
+        cert-key-chain replace-all-with \{ default \{ \
+            cert $::main__cert key $::main__key chain $::main__cert_chain \} \}]
+}
+
+# create stream profile
+set stream_profile [iapp_conf create ltm profile stream ${app}_stream]
+
+#create main StoreFront redirect irule
+set sf_redirect_irule {
+when ACCESS_ACL_ALLOWED {
+#extract the APM session client type
+set type [ACCESS::session data get session.client.type]
+# If the traffic is not citrix/ica and base url="/", then redirect
+if { !($type starts_with "citrix") } {
+    if { [HTTP::uri] == "/" } {
+        # todo: add username/session to logging
+        log local0. "Redirecting [HTTP::host] to <SF_URI>"
+        ACCESS::respond 302 Location "https://[HTTP::host]<SF_URI>"
+        }
+    }
+}
+}
+
+# update irule with store front URI
+set sf_redirect_irule [string map [list <SF_URI> $uri] $sf_redirect_irule]
+# create redirect irule
+set sf_redirect_irule [iapp::conf create ltm rule ${app}_sf_redirect_irule $sf_redirect_irule]
+
+
+###############################################################################
+###   beginning of APM policy template
+###############################################################################
+
+# create saml-aaa server map to be referenced in the vpe saml auth
+# Create saml sp
+set saml_sp [iapp::conf create apm aaa saml ${app}_saml_sp \{ \
+    sp-host $::main__fqdn \
+    entity-id "https://$::main__fqdn/sp-apm/" \
+    idp-connectors replace-all-with \{ $::saml__idp_connector \} \
+    is-authn-request-signed true \
+    sp-certificate $::saml__sp_cert \
+    sp-signkey $::saml__sp_key \
+    sp-decryption-cert $::saml__sp_cert \
+    sp-decryption-key $::saml__sp_key \} ]
+
+# create pre-proc-map
+set pre_proc_map { 
+    <CUSTOM_URI> "$uri" 
+    <DOMAIN> "$::main__fqdn"
+    <LOG_SETTINGS> "log-settings replace-all-with { $::apm__log_profile }" 
+    <LOGOUT_URI> "replace-all-with \{${uri}Authentication/Logoff\}" 
+    <SAML_SP> "$saml_sp"
+	<FORM_ACTION_DIR> ExplicitAuth
+	<START_URI_DIR> ExplicitAuth 
+	<CLIENT_BUNDLE> "default-citrix-client-bundle"
+}
+
+puts " *****************  pre_proc_map           ****************"
+puts "$pre_proc_map"
+
+# swap out variables with actual values defined in pre_proc_map
+set pre_proc_map [subst $pre_proc_map]
+
+puts " *****************  updated pre_proc_map   ****************"
+puts "$pre_proc_map"
+
+# maps the now static pre_proc_map to objects in the apm_map
+array set apm_map [string map $pre_proc_map [array get apm_map]]
+puts "--------------------------------------------------------------------------------"
+puts "---------------  apm_map updated with pre_proc_map  ----------------------------"
+puts ""
+foreach {key value} [array get apm_map] {
+    puts "$key { $value }"
+}
+puts "----------------------------------  end  ---------------------------------------"
+puts "--------------------------------------------------------------------------------"
+
+# create base apm_profile
+# "ppp rba websso" seem to be needed in every other apm config i reviewed
+# similar to the connectivity profile, maybe not actually used,
+# but still needed to complete the config
+set apm_profiles "ppp rba vdi websso "
+puts "starting apm profile list:  $apm_profiles"
+# append main apm_proc apm profiles
+append apm_profiles [iapp_apm_config apm_map]
+puts "-=-=-=-=-=-=-=- final apm_profiles -=-=-=-=-=-=- "
+puts $apm_profiles
+
+
+###############################################################################
+###   END of APM policy template
+###############################################################################
+
+# create vips
+set 80_vs [iapp::conf create ltm virtual ${::main__fqdn}_80_vs \
+    destination $::main__vip:80 \
+    mask 255.255.255.255 \
+    ip-protocol tcp \
+    profiles replace-all-with \{ \
+        /Common/${app}.app/$http_profile \{ \} \
+        /Common/${app}.app/$wan_tcp \{ context clientside \} \
+        /Common/${app}.app/$lan_tcp \{ context serverside \} \
+    \}\
+    rules \{ /Common/_sys_https_redirect \} \
+    source-address-translation \{ type automap \} \
+    source 0.0.0.0/0 \
+    translate-address enabled \
+    translate-port enabled ]
+
+set 443_vs [iapp::conf create ltm virtual ${::main__fqdn}_443_vs \
+    destination $::main__vip:443 \
+    mask 255.255.255.255 \
+    ip-protocol tcp \
+    profiles replace-all-with \{ \
+        /Common/${app}.app/$http_profile \{ \} \
+        /Common/${app}.app/$wan_tcp \{ context clientside \} \
+        /Common/${app}.app/$lan_tcp \{ context serverside \} \
+        /Common/${app}.app/$clientssl \{ context clientside \} \
+        /Common/apm-default-serverssl \{ context serverside \} \
+        $apm_profiles \
+        \} \
+    source-address-translation \{ type automap \} \
+    source 0.0.0.0/0 \
+    translate-address enabled \
+    rules \{ $sf_redirect_irule \} \
+    persist replace-all-with \{ cookie \{ default yes \} \} \
+    fallback-persistence source_addr \
+    pool $::main__pool \
+    translate-port enabled ]
+
+
+# todo:  offer to create pool outside iapp, so it can be used by other iapps,
+#           not tied to a single iapp - potentially do the same for clientssl profile
+
+
+##############################################################
+###  picked up the following to commit APM policy after merge from iapp
+##############################################################
+### right now this fails cause I'm not commiting an access profile during DEV/research work
+# APM policies do not commit in a reliable manner when configured via iApp.
+# This time-bomb script insures that the policy gets committed.
+# See subcase SR1-315233635 for details.
+set dir [tmsh::pwd]
+set fn "/var/tmp/iapp_${app}.sh"
+catch {
+    set fh [open $fn w]
+    puts $fh "sleep 5"
+    puts $fh "tmsh modify apm profile access ${dir}/${app} generation-action increment"
+    close $fh
+    exec chmod 777 $fn
+    exec $fn &
+} {}
+
+
+iapp_template stop
+            }
+            macro {
+            }
+            presentation {
+
+section options {
+    choice display_help display "xxlarge" default "hide"
+    optional ( options.display_help == "full" ) { message display_help_max }
+
+    choice config_mode display "xxlarge" default "basic" {
+        "Basic - Use recommended settings" => "recommended"  ,
+        "Advanced - Configure advanced options" => "advanced"
+    }
+
+    optional ( options.display_help == "full" ) {
+        message config_mode_info " *** TESTING *** Advanced options not being used at this time. - This template supports two configuration modes. Basic mode automatically configures many options, such as load balancing method or profile types, on the BIG-IP system using F5 recommended settings without user intervention. Advanced mode allows you to review and edit the F5 recommended settings before configuring the system."
+    }
+}
+
+section intro {
+    message hello
+    optional ( options.display_help == "full" ) { 
+        message exec_summ
+        message additional_info
+        message additional_info2
+        message additional_info3
+        message additional_info4
+        message additional_info5
+        message additional_info6
+    }
+}
+
+section main {
+    # remove some defaults for final iapp version
+    string fqdn default "vdi.company.com" display "xxlarge" required validator "fqdn"
+    optional ( options.display_help ==  "full" ) { message fqdn_full }
+
+    string sf_uri default "/Citrix/XenApp/" required display "xxlarge"
+    optional ( options.display_help ==  "full" ) { message sf_uri_full }
+
+    string vip default "192.168.2.1" display "xxlarge" required validator "IpAddress"
+    optional ( options.display_help == "full" ) { message vip_extra }
+    
+    # todo:  add pool creation to script - select existing node, advanced: add node outside iapp if not there
+    choice pool display "xxlarge" tcl {
+        set ::choices [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_get_items ltm pool]
+        return [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_safe_display ::choices]
+    }
+    optional ( options.display_help == "full" ) { message pool_more }
+    
+
+    optional ( options.display_help ==  "full" ) {
+        message clientssl_profile_full 
+        message clientssl_profile_full2 
+        message clientssl_profile_full3
+    }
+    choice cert default "/Common/default.crt" display "xxlarge" tcl {
+        set ::choices [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_get_items -norecursive -filter NAME !~ ca-bundle.crt|f5-irule.crt sys file ssl-cert]
+        return [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_safe_display ::choices]
+    }
+    choice key default "/Common/default.key" display "xxlarge" tcl {
+        set ::choices [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_get_items -norecursive -filter security-type ne "password" sys file ssl-key]
+        return [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_safe_display ::choices]
+    }
+    optional ( cert == "/Common/default.crt" || key == "/Common/default.key" ) { message key_cert_critical }
+    choice cert_chain display "xxlarge" tcl {
+        set ::choices [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_get_items -norecursive sys file ssl-cert]
+        return [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_safe_display ::choices]
+    }
+    optional ( options.display_help ==  "full" ) {
+        message cert_chain_SAML
+        message cert_chain_additional 
+    }
+}
+
+section apm {
+    message apm_logging "Select logging profile for APM logs"
+    choice log_profile default "/Common/default-log-setting" display "xxlarge" tcl {
+        set ::choices [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_get_items -norecursive apm log-setting]
+        return [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_safe_display ::choices]
+    }
+    optional ( options.display_help ==  "full" ) {
+        message log_profile_full "default = default-log-setting, create custom apm logging profile, it will show up here..."
+    }
+}
+
+section saml {
+    message sp_cert_key_info
+    optional ( options.display_help ==  "full" ) {
+        message sp_cert_key_more
+    }
+    choice sp_cert display "xxlarge" tcl {
+        set ::choices [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_get_items -norecursive sys file ssl-cert]
+        return [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_safe_display ::choices]
+    }
+
+    choice sp_key display "xxlarge" tcl {
+        set ::choices [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_get_items -norecursive sys file ssl-key]
+        return [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_safe_display ::choices]
+    }
+
+    # enter advanced config options for configuring seperate saml sp decryption cert/key
+    optional ( options.config_mode == "advanced" ) {
+        message saml_decrypt_cert_key " *** These options are not being used, just testing advanced options for future use ***"
+        choice sp_d_cert display "xxlarge" tcl {
+            set ::choices [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_get_items -norecursive sys file ssl-cert]
+            return [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_safe_display ::choices]
+        }
+        choice sp_d_key display "xxlarge" tcl {
+            set ::choices [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_get_items -norecursive sys file ssl-key]
+            return [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_safe_display ::choices]
+        }
+    }
+    choice idp_connector display "xxlarge" tcl {
+        set ::choices [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_get_items apm aaa saml-idp-connector]
+        return [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_safe_display ::choices]
+    }
+    optional ( options.display_help ==  "full" ) { message idp_connector_full }
+
+# was working to setup UI to get certificates for SP identification/encryption/decryption
+#    choice idp_connector display "xxlarge" tcl {
+#        set ::choices [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_get_items apm aaa saml-idp-connector]
+#        return [tmsh::run_proc f5.iapp.1.5.2.cli:iapp_safe_display ::choices]
+#    }
+}
+
+section todo {
+    message what
+    optional ( options.display_help == "full" ) {
+        message todo1
+        message todo2
+        message todo3
+        message todo4
+        message todo5
+        message todo6
+        message todo7
+        message todo8
+    }
+}
+
+section about {
+    message about
+    optional ( options.display_help == "full" ) {
+        message creation
+        message v1
+    }
+}
+
+text {
+    options "Template Options"
+    options.display_help "Do you want to see inline help or additional information?" {
+         "Yes, show inline help" => "full",
+         "No, do not show inline help" => "hide"
+    }
+
+    options.display_help_max "" "Inline help is available to provide contextual descriptions to aid in the completion of this configuration.  Select to show or hide the inline help in this template. Important notes and warnings are always visible, no matter which selection you make here."
+    intro "SAML VDI iApp"
+    intro.hello "Introduction" "This template is used to easily deploy SAML specific F5 VDI configurations"
+    intro.exec_summ "Executive Summary" "This application is a SAML SP initiated app on F5 to an iDp.  Once authentication is complete, we consume the SAML token and SSO user into StoreFront"
+    intro.additional_info "requires APM" "LTM and APM are required.  Solution was developed on v14.0.6"
+    intro.additional_info2 "SAML" "SAML iDp connection should be configured prior to iApp deployment.  This includes the external iDp connection and supporting cert/key"
+    intro.additional_info3 "Persistence" "This configuration typically has a single pool member, which is the internal vip for StoreFront, so no persistence is needed.  But the default cookie and fallback source_addr have been applied."
+    intro.additional_info4 "Certificates" "Certificate, key and supporting chain must be on the system already"
+    intro.additional_info5 "Strick Updates" "Strick Updates should stay ENABLED.  iApp can and should be redeployed with any necessary changes to the app. iApp should be updated to support any major changes as needed."
+    intro.additional_info6 "Firewalls" "Firewalls need to be opened from external to Citrix on tcp:80/443.  The IPs (selfs+float) of the LTMs need access to the necessary StoreFront web front over tcp/443, including direct access to the Citrix farm on 1494 for ICA application traffic."
+    main "Virtual Server Questions"
+    main.fqdn "FQDN" 
+    main.sf_uri "StoreFront URI"
+    main.sf_uri_full "StoreFront URI info" "Specify the URI (case sensitive) used for XenDesktop or XenApp on the Web Interface or StoreFront server. The default URI when using Web Interface servers for XenApp is '/Citrix/XenApp/'. The default URI for XenDesktop 5.x is '/Citrix/XenDesktopweb/'.  The URI when using StoreFront follows the pattern '/Citrix/<storename>Web/' where <storename> is replaced with the name you used when creating the store for this Citrix site. You can verify your URI for StoreFront by opening the StoreFront console and highlighting 'Receiver for Web'. Note the 'Website URL:' field contains the URI you should use."
+    main.vip "Virtual IP"
+    main.vip_extra "" "This deploys two virtual servers, http:80 redirect to https:443"
+    main.pool "Destination Pool"
+    main.pool_more "" "Select a preconfigured existing pool - No Create option. See todo/options below"
+    #main.clientssl_profile "Client side SSL Profile"
+    
+    main.clientssl_profile_full "" "Select the certificate the system uses for client-side SSL processing. Importing SSL certificates and keys is not a part of this template. To select any new certificates and keys you import, you need to restart or reconfigure this template to have them appear in the list."
+    main.clientssl_profile_full2 "" "If you have already created a Client SSL profile that includes the appropriate certificate and key, you can select it from the list.  Otherwise, the iApp creates a new Client SSL profile."
+    main.clientssl_profile_full3 "" "If your key is password-protected, you must manually create a Client SSL profile outside the iApp, and then select it from the list above."
+    main.cert "clientssl cert"
+    main.key "clientssl key"
+    main.key_cert_critical "" "You have selected a default BIG-IP certificate and/or key. This application service configuration is incomplete and will not be secure until you import and assign a trusted certificate and key that are valid for all fully qualified domain names used to access the application. To select any new certificates and keys you import, you need to restart or reconfigure this template."
+    main.cert_chain_additional "" "Intermediate certificates or intermediate certificate chains are used to help systems which depend on SSL certificates for peer identification. The chain certificate is intended to create a chain of trust between the CA that signed the certificate and the CA that is already trusted by the recipient of the certificate. This allows the recipient to verify the validity of the certificates presented, even when the signing CA is unknown. Chain certificates must be created or imported onto this BIG-IP system prior to running this iApp. See SOL13302 on http://support.f5.com for help on creating an intermediate certificate chain."
+    main.cert_chain_SAML "" "Cert chain is required for SAML certificates, should be a TrustWave bundle"
+    apm "APM"
+    saml "SAML"
+    saml.sp_cert_key_info "" "This is the certificate/key that is used to identify/sign/encrypt/decrypt saml assertions/tokens"
+    saml.idp_connector_full "" "Must pre-create IDP connector or re-use what is already there if existing SAML-VDI deployments exist"
+    saml.sp_d_cert "SP SAML Decryption Cert"
+    saml.sp_d_key "SP SAML Decryption Key"
+    todo "TODO/Options list"
+    todo.what "" "List of 'to do/options' items so they can be tracked and prioritized - Show inline help for more details"
+    todo.todo1 "todo 1" "Move base / redirect to vpe allow-redirect?  Basically, change the vpe success-allow to redirect from / to /Citrix/XenApp/ instead of the irule..."
+    todo.todo2 "todo 2" "Put in error checking for not creating a new ssl profile and selecting NON default values"
+    todo.todo3 "todo 3" "SAML assertion irule logging feedback:  The current prod solution has an irule that was originally used to troubleshoot/log the saml assertion when posted back to APM (to see failures).  Those logs are now used for division vdi reporting in Splunk.  Need to see if the irule is really necessary or if the reporting can be updated to native APM logs (logging profile), or if we need to simplify the irule"
+    todo.todo4 "todo 4" "Advanced options: add option to create destination pool or clientssl profile outside iapp, so it can be re-used and not deleted when an iapp is removed"
+    todo.todo5 "todo 5" "set desciptions for objects?"
+    todo.todo6 "todo 6" "Is persistence really needed since there should only be 1 pool member? - Probably..."
+    todo.todo7 "todo 7" "Advanced Options:  Add logic to apply additional irules through iApp configuration screen"
+    todo.todo8 "todo 8" "Research bigiq integrations and sending stats back to bigiq"
+    about "About"
+    about.about "" "Show inline help for more information"
+    about.creation "" "This iApp was developed during Sept. 2019 by Ben Gordon (b.gordon@f5.com).  It is based on the f5.citrix_vdi.v2.4.1rc1 iApp, which was used to deploy the foundation of the apps, then, strict updates were disabled, and the app/apm-policy was heavily modified to support saml auth."
+    about.v1 "v0.5" "This first general availability (GA) release is intended to take the necessary information and deploy LTM/APM configurations needed for external SAML VDI apps with SAML auth.  It inludes options for creating or reusing clientssl profile, selecting necessary apm logging profile, and cert/key/idp-connector details for SAML. *** remove default values *** "
+}
+            }
+            role-acl none
+            run-as none
+        }
+    }
+    description none
+    ignore-verification false
+    requires-bigip-version-max none
+    requires-bigip-version-min 12.1.0
+    requires-modules { ltm apm }
+    signing-key none
+    tmpl-checksum none
+    tmpl-signature none
+}
