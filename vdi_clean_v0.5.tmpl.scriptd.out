@@ -1,0 +1,297 @@
+Starting iApp /Common/vdi_clean_v0.5 11/29/2019 15:53:24
+
+create ltm profile http benny_http defaults-from /Common/http header-erase Accept-Encoding insert-xforwarded-for enabled proxy-type reverse redirect-rewrite matching
+create ltm profile tcp benny_wan_optimized_tcp defaults-from /Common/tcp-wan-optimized idle-timeout 1800 keep-alive-interval 75 nagle disabled pkt-loss-ignore-burst 8 pkt-loss-ignore-rate 10000 proxy-buffer-low 65536 receive-window-size 1048576 selective-nack enabled send-buffer-size 1048576 syn-rto-base 200
+create ltm profile tcp benny_lan_optimized_tcp defaults-from /Common/tcp-lan-optimized idle-timeout 1800
+create ltm cipher rule benny_cipher_rule cipher !EXPORT:!SSLv3:!TLSv1:!TLSv1_1:!EDH:!3DES:ECDHE+AES-GCM:ECDHE+AES:ECDHE+RSA:RSA+AES-GCM:RSA+AES
+create ltm cipher group benny_cipher_group allow replace-all-with { benny_cipher_rule }
+create ltm profile client-ssl benny_clientssl defaults-from /Common/clientssl options { dont-insert-empty-fragments single-dh-use } ciphers none cipher-group benny_cipher_group cert-key-chain replace-all-with { default { cert /Common/tparty.benlab.io key /Common/tparty.benlab.io chain /Common/benlab_bundle } }
+create ltm profile stream benny_stream
+create ltm rule benny_sf_redirect_irule
+when ACCESS_ACL_ALLOWED {
+#extract the APM session client type
+set type [ACCESS::session data get session.client.type]
+# If the traffic is not citrix/ica and base url="/", then redirect
+if { !($type starts_with "citrix") } {
+    if { [HTTP::uri] == "/" } {
+        # todo: add username/session to logging
+        log local0. "Redirecting [HTTP::host] to /Citrix/XenApp/"
+        ACCESS::respond 302 Location "https://[HTTP::host]/Citrix/XenApp/"
+        }
+    }
+}
+
+create apm aaa saml benny_saml_sp { sp-host vdi.company.com entity-id https://vdi.company.com/sp-apm/ idp-connectors replace-all-with { /Common/nsa_idp } is-authn-request-signed true sp-certificate /Common/tparty.benlab.io sp-signkey /Common/tparty.benlab.io sp-decryption-cert /Common/tparty.benlab.io sp-decryption-key /Common/tparty.benlab.io }
+ *****************  pre_proc_map           ****************
+
+    <CUSTOM_URI> "$uri"
+    <DOMAIN> "$::main__fqdn"
+    <LOG_SETTINGS> "log-settings replace-all-with { $::apm__log_profile }"
+    <LOGOUT_URI> "replace-all-with \{${uri}Authentication/Logoff\}"
+    <SAML_SP> "$saml_sp"
+        <FORM_ACTION_DIR> ExplicitAuth
+        <START_URI_DIR> ExplicitAuth
+        <CLIENT_BUNDLE> "default-citrix-client-bundle"
+
+ *****************  updated pre_proc_map   ****************
+
+    <CUSTOM_URI> "/Citrix/XenApp/"
+    <DOMAIN> "vdi.company.com"
+    <LOG_SETTINGS> "log-settings replace-all-with { /Common/default-log-setting }"
+    <LOGOUT_URI> "replace-all-with {/Citrix/XenApp/Authentication/Logoff}"
+    <SAML_SP> "benny_saml_sp"
+        <FORM_ACTION_DIR> ExplicitAuth
+        <START_URI_DIR> ExplicitAuth
+        <CLIENT_BUNDLE> "default-citrix-client-bundle"
+
+--------------------------------------------------------------------------------
+---------------  apm_map updated with pre_proc_map  ----------------------------
+
+end_redirect {
+        <AGENT_DEF> "close-session false
+                     url \"https://%{session.server.network.name}/Citrix/XenApp/\""
+        <AGENT_TYPE> ending-redirect
+        <ITEM_CAPTION> {"Allow and Redirect"}
+        <ITEM_TYPE> {item-type ending}
+        <ITEM_RULES> {}   }
+end_allow {
+        <AGENT_DEF> {}
+        <AGENT_TYPE> ending-allow
+        <ITEM_CAPTION> {"Allow"}
+        <ITEM_TYPE> {item-type ending}
+        <ITEM_RULES> {}   }
+act_saml_auth {
+        <AGENT_TYPE> aaa-saml
+        <AGENT_DEF> "server benny_saml_sp"
+        <ITEM_CAPTION> {"SAML Auth"}
+        <RULE_EXPR_1> {"expr {[mcget {session.saml.last.result}] == 1}"}
+        <RULE_NEXT_1> variable_assign
+        <RULE_NEXT_0> end_deny   }
+default {
+        <PROFILE_TYPE> {apm profile access}
+        <GROUP_DEF> {type logout }
+        <PROFILE_DEF> "accept-languages replace-all-with { en }
+            access-policy <ITEM>
+            defaults-from /Common/access
+            customization-group <ITEM>_logout
+            eps-group <ITEM>_eps
+            errormap-group <ITEM>_errormap
+            domain-cookie vdi.company.com
+            framework-installation-group <ITEM>_frameworkinstallation
+            general-ui-group <ITEM>_general_ui
+            # assign sso form created below
+            sso-name <ITEM>_sso_form_based
+            logout-uri-include replace-all-with {/Citrix/XenApp/Authentication/Logoff}
+            logout-uri-timeout 1
+            log-settings replace-all-with { /Common/default-log-setting }"  }
+prefix { /Common/benny.app/benny }
+sso_form_based {
+        <PROFILE_TYPE> {apm sso form-based}
+        <PROFILE_DEF>  "passthru true
+            form-action /Citrix/XenApp/ExplicitAuth/LoginAttempt
+            form-field \"LoginBtn Log+On\nStateContext \"
+            form-password password
+            form-username username
+            start-uri /Citrix/XenApp/ExplicitAuth/Login*
+            success-match-type cookie
+            success-match-value CtxsAuthId"   }
+end_deny {
+        <ACCESS_START_ITEM> <PREFIX>_ent
+        <ACCESS_ENDING> <PREFIX>_end_deny
+        <AGENT_TYPE> ending-deny
+        <GROUP_DEF> {type logout }
+        <ITEM_CAPTION> {"Deny"}
+        <ITEM_TYPE> {item-type ending}
+        <ITEM_COLOR> {2}
+        <ITEM_RULES> {}   }
+connect {
+        <PROFILE_TYPE> {apm profile connectivity}
+        <GROUP_DEF> {type secure-access-client }
+        <PROFILE_DEF> "customization-group <ITEM>
+                       citrix-client-bundle default-citrix-client-bundle
+                       defaults-from /Common/connectivity"   }
+sso_credential_mapping {
+        <AGENT_TYPE> variable-assign
+        <AGENT_DEF> "type sso-cred-mapping
+            variables {{
+            expression \"mcget {session.logon.last.username}\"
+            varname session.sso.token.last.username }{
+            expression \"mcget {session.logon.last.password}\"
+            varname session.sso.token.last.password }}"
+        <ITEM_CAPTION> {"SSO Credential Mapping"}
+        <RULE_NEXT_0> end_allow   }
+variable_assign {
+        <AGENT_TYPE> variable-assign
+        <AGENT_DEF> "variables {{
+            expression \"mcget {session.saml.last.nameIDValue}\"
+            varname session.logon.last.username }{
+            expression \"mcget {session.saml.last.attr.name.pw}\"
+            secure true varname session.logon.last.password }}"
+        <ITEM_CAPTION> {"Session Variable Assign"}
+        <RULE_NEXT_0> sso_credential_mapping   }
+ent {
+        <ITEM_AGENT> {}
+        <ITEM_CAPTION> {"Start"}
+        <ITEM_TYPE> {}
+        <RULE_NEXT_0> act_saml_auth   }
+----------------------------------  end  ---------------------------------------
+--------------------------------------------------------------------------------
+starting apm profile list:  ppp rba vdi websso
+create  apm policy policy-item /Common/benny.app/benny_act_saml_auth {
+        agents replace-all-with {
+        /Common/benny.app/benny_act_saml_auth_ag { type aaa-saml }}
+    caption "SAML Auth"
+    color 1
+    item-type action
+    rules
+        {{
+            caption Successful
+            expression "expr {[mcget {session.saml.last.result}] == 1}"
+            next-item /Common/benny.app/benny_variable_assign
+        }{
+            caption fallback
+            next-item /Common/benny.app/benny_end_deny
+        }}
+}
+create  apm policy agent aaa-saml /Common/benny.app/benny_act_saml_auth_ag {
+        server benny_saml_sp
+}
+create  apm profile connectivity /Common/benny.app/benny_connect {
+        customization-group /Common/benny.app/benny_connect
+                       citrix-client-bundle default-citrix-client-bundle
+                       defaults-from /Common/connectivity
+}
+create  apm policy customization-group /Common/benny.app/benny_connect {     type secure-access-client }
+create  apm policy access-policy /Common/benny.app/benny {
+        caption general
+    start-item /Common/benny.app/benny_ent
+    default-ending /Common/benny.app/benny_end_deny
+    items replace-all-with {
+        /Common/benny.app/benny_act_saml_auth {}
+        /Common/benny.app/benny_end_allow {}
+        /Common/benny.app/benny_end_deny {}
+        /Common/benny.app/benny_end_redirect {}
+        /Common/benny.app/benny_ent {}
+        /Common/benny.app/benny_sso_credential_mapping {}
+        /Common/benny.app/benny_variable_assign {}
+    }
+}
+
+create  apm profile access /Common/benny.app/benny {
+        accept-languages replace-all-with { en }
+            access-policy /Common/benny.app/benny
+            defaults-from /Common/access
+            customization-group /Common/benny.app/benny_logout
+            eps-group /Common/benny.app/benny_eps
+            errormap-group /Common/benny.app/benny_errormap
+            domain-cookie vdi.company.com
+            framework-installation-group /Common/benny.app/benny_frameworkinstallation
+            general-ui-group /Common/benny.app/benny_general_ui
+            # assign sso form created below
+            sso-name /Common/benny.app/benny_sso_form_based
+            logout-uri-include replace-all-with {/Citrix/XenApp/Authentication/Logoff}
+            logout-uri-timeout 1
+            log-settings replace-all-with { /Common/default-log-setting }
+}
+create  apm policy policy-item /Common/benny.app/benny_end_allow {
+        agents replace-all-with {
+        /Common/benny.app/benny_end_allow_ag { type ending-allow }}
+    caption "Allow"
+    color 1
+    item-type ending
+
+}
+create  apm policy agent ending-allow /Common/benny.app/benny_end_allow_ag {
+
+}
+create  apm policy policy-item /Common/benny.app/benny_end_deny {
+        agents replace-all-with {
+        /Common/benny.app/benny_end_deny_ag { type ending-deny }}
+    caption "Deny"
+    color 2
+    item-type ending
+
+}
+create  apm policy agent ending-deny /Common/benny.app/benny_end_deny_ag {
+        customization-group /Common/benny.app/benny_end_deny_ag
+}
+create  apm policy customization-group /Common/benny.app/benny_end_deny_ag {     type logout }
+create  apm policy policy-item /Common/benny.app/benny_end_redirect {
+        agents replace-all-with {
+        /Common/benny.app/benny_end_redirect_ag { type ending-redirect }}
+    caption "Allow and Redirect"
+    color 1
+    item-type ending
+
+}
+create  apm policy agent ending-redirect /Common/benny.app/benny_end_redirect_ag {
+        close-session false
+                     url "https://%{session.server.network.name}/Citrix/XenApp/"
+}
+create  apm policy policy-item /Common/benny.app/benny_ent {
+        caption "Start"
+    color 1
+
+    rules
+        {{
+            caption fallback
+            next-item /Common/benny.app/benny_act_saml_auth
+        }}
+}
+create  apm policy policy-item /Common/benny.app/benny_sso_credential_mapping {
+        agents replace-all-with {
+        /Common/benny.app/benny_sso_credential_mapping_ag { type variable-assign }}
+    caption "SSO Credential Mapping"
+    color 1
+    item-type action
+    rules
+        {{
+            caption fallback
+            next-item /Common/benny.app/benny_end_allow
+        }}
+}
+create  apm policy agent variable-assign /Common/benny.app/benny_sso_credential_mapping_ag {
+        type sso-cred-mapping
+            variables {{
+            expression "mcget {session.logon.last.username}"
+            varname session.sso.token.last.username }{
+            expression "mcget {session.logon.last.password}"
+            varname session.sso.token.last.password -OBSCURED-
+}
+create  apm sso form-based /Common/benny.app/benny_sso_form_based {
+        passthru true
+            form-action /Citrix/XenApp/ExplicitAuth/LoginAttempt
+            form-field "LoginBtn Log+On
+StateContext "
+            form-password -OBSCURED-
+            form-username username
+            start-uri /Citrix/XenApp/ExplicitAuth/Login*
+            success-match-type cookie
+            success-match-value CtxsAuthId
+}
+create  apm policy policy-item /Common/benny.app/benny_variable_assign {
+        agents replace-all-with {
+        /Common/benny.app/benny_variable_assign_ag { type variable-assign }}
+    caption "Session Variable Assign"
+    color 1
+    item-type action
+    rules
+        {{
+            caption fallback
+            next-item /Common/benny.app/benny_sso_credential_mapping
+        }}
+}
+create  apm policy agent variable-assign /Common/benny.app/benny_variable_assign_ag {
+        variables {{
+            expression "mcget {session.saml.last.nameIDValue}"
+            varname session.logon.last.username }{
+            expression "mcget {session.saml.last.attr.name.pw}"
+            secure true varname session.logon.last.password -OBSCURED-
+}
+-=-=-=-=-=-=-=- final apm_profiles -=-=-=-=-=-=-
+ppp rba vdi websso /Common/benny.app/benny_connect /Common/benny.app/benny
+create ltm virtual vdi.company.com_80_vs destination 192.168.2.1:80 mask 255.255.255.255 ip-protocol tcp profiles replace-all-with { /Common/benny.app/benny_http { } /Common/benny.app/benny_wan_optimized_tcp { context clientside } /Common/benny.app/benny_lan_optimized_tcp { context serverside } } rules { /Common/_sys_https_redirect } source-address-translation { type automap } source 0.0.0.0/0 translate-address enabled translate-port enabled
+create ltm virtual vdi.company.com_443_vs destination 192.168.2.1:443 mask 255.255.255.255 ip-protocol tcp profiles replace-all-with { /Common/benny.app/benny_http { } /Common/benny.app/benny_wan_optimized_tcp { context clientside } /Common/benny.app/benny_lan_optimized_tcp { context serverside } /Common/benny.app/benny_clientssl { context clientside } /Common/apm-default-serverssl { context serverside } ppp rba vdi websso /Common/benny.app/benny_connect /Common/benny.app/benny } source-address-translation { type automap } source 0.0.0.0/0 translate-address enabled rules { benny_sf_redirect_irule } persist replace-all-with { cookie { default yes } } fallback-persistence source_addr pool /Common/internal_vdi_t443_pool translate-port enabled
+
+Ending iApp /Common/vdi_clean_v0.5 11/29/2019 15:53:24
+Run time 87 msec
