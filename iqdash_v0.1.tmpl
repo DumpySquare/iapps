@@ -1,0 +1,243 @@
+sys application template /Common/iqdash_v0.1 {
+    actions {
+        definition {
+            html-help { }
+            implementation {
+
+package require iapp 1.0.0
+iapp::template start
+
+# add some logic to check to see if iapp is already deployed with another name?
+
+# add faveicon base64 encoded image
+
+# assign app name that user typed in as a variable
+set app $tmsh::app_name
+
+set cdate [clock format [clock seconds] -format "%Y-%m-%d:%H:%M:%S"]
+
+# all "puts" statements log iapp execution stuff to /var/tmp/scriptd.out
+puts "Executing ${app} iApp - ${cdate}"
+# tmsh::log statements log to /var/log/ltm
+tmsh::log "Executing ${app} iApp - ${cdate}"
+
+# disable strict-updates so the icall can update the ifiles as needed
+iapp::conf modify sys application service $app strict-updates disabled
+
+# set temp file location
+set tempFileLocation "/var/tmp/iapp_${app}_iquery_data.txt"
+# create empty file - only needed for initial deployment
+exec touch $tempFileLocation
+# configure empty file as sys ifile
+set sysIfile [iapp::conf create sys file ifile ${app}_iquery_sys_ifile source-path file:$tempFileLocation]
+# create ltm ifile reference for sys ifile...
+set ltmIfile [iapp::conf create ltm ifile ${app}_iquery_ltm_ifile file-name $sysIfile]
+
+
+set irule {
+when HTTP_REQUEST {
+
+    set pageColor "#eae9e5"
+    # Retrieve ifile contents and split each line into a list
+    set iFileContent [ifile get "/Common/<APP>.app/<APP>_iquery_ltm_ifile"]
+
+    set iFileContent [split $iFileContent "\n"]
+    log local0. "--- $iFileContent"
+
+    #take first line(list item 0) and scan it to the different variables we need
+    scan [lindex $iFileContent 0] {%[^,],%[^,],%s} host date time
+
+    #
+    set selfs [split [lindex $iFileContent 1] ";"]
+    set iqs [split [lindex $iFileContent 2] ";"]
+
+    # uri switch
+    switch [string tolower [HTTP::uri]] {
+        "/raw_export" {
+            # bulk data export function - for global iquery dashboard and/or other tools
+            HTTP::respond 200 content $iFileContent noserver Cache-Control no-cache Connection Close
+        }
+        "/csv_export" {
+            # csv data export function
+            append csv "$host,$date,$time\n"
+            foreach self $selfs {
+                append csv "$self\n"
+            }
+            foreach iq $iqs {
+                append csv "$iq\n"
+            }
+            set filename [clock format [clock seconds] -format "%Y%m%d_%H%M%S_iquery.csv"]
+            HTTP::respond 200 content $csv \
+                "Content-Type" "text/csv" "Content-Disposition" "attachment: filename=${filename}" \
+                "noserver" "Cache-Control" "no-cache" "Connection" "Close";
+            # unset the variable to keep from re-appending all the informtion if clicked multiple times
+            unset csv
+        }
+        default {
+            # append all the data into the html format we want
+            append response "<html>\n"
+            append response "<head>\n"
+            append response "\t<title>iQuery Dashboard</title>\n"
+            append response "</head>\n\n"
+            append response "<body bgcolor='#eae9e5' style='font-family:consolas;text-align:center'>\n"
+            append response "<br><h1>$host</h1>\n"
+            append response "<p>Data Refreshed: $date - $time</p>\n"
+            append response "<table border='0' cellpadding='2' cellspacing='0' width='500' align='center'>\n"
+            append response "\t<tr><th>Self-IPs</th><th>Port-Lockdown</th></tr>\n"
+
+            # loop through selfs
+            foreach self $selfs { 
+                set self [split $self ","]
+                append response "\t<tr><td>[lindex $self 0]</td><td>[lindex $self 1]</td></tr>\n" 
+                }
+            append response "</table>\n<br>\n\n"
+            append response "<table border='1' cellpadding='2' cellspacing='0' width='800' align='center'>\n"
+            append response "\t<tr><th>Src-IP</th><th>Dest-Device</th><th>Dest-IP:PORT</th><th>Status</th></tr>\n"
+
+            # loop through iquery connection details
+            foreach iq $iqs { 
+                # skip emtpy item at end of list
+                if { $iq eq "" } { continue }
+                # split object into list of iquery connection details
+                set iq [split $iq ","]
+                # if not connected, change page color for row to red
+                if { [lindex $iq 3] ne "connected" } {
+                    set pageColor "#ffcccc"
+                }
+                # set row color and table entries
+                append response "\t<tr style='background-color:$pageColor'>"
+                append response "<td>[lindex $iq 0]</td><td>[lindex $iq 1]</td><td>[lindex $iq 2]:4353</td><td>[lindex $iq 3]</td>"
+                append response "</tr>\n" 
+                }
+            append response "</table>\n"
+            append response "<p><a href='csv_export'>CSV Export</a></p>"
+            append response "<button onclick='window.location.href = \"/csv_export\";'>CSV Export</button>"
+            append response "</body>\n"
+            append response "</html>\n"
+            HTTP::respond 200 content $response noserver Cache-Control no-cache Connection Close
+        }
+    }
+
+}
+}
+# map irule variables and create irule
+set irule [string map [list <APP> $app] $irule]
+set irule [iapp::conf create ltm rule ${app}_irule $irule]
+
+set icall {
+    set cdate [clock format [clock seconds] -format "%Y-%m-%d,%H:%M:%S"]
+    set host [tmsh::get_field_value [lindex [tmsh::get_config sys global-settings] 0] hostname]
+    #tmsh::log "------------------------------------"
+    #tmsh::log "--- icall <APP>: $host - $cdate ---"
+
+    foreach ip [tmsh::get_config /net self] {
+        #tmsh::log "[tmsh::get_field_value $ip address],[tmsh::get_field_value $ip allow-service]"
+        append selfs "[tmsh::get_field_value $ip address],[tmsh::get_field_value $ip allow-service];"
+    }
+
+    foreach obj [tmsh::get_status /gtm iquery] {
+        #tmsh::log "[tmsh::get_field_value $obj server-name],[tmsh::get_name $obj],[tmsh::get_field_value $obj connect-state]"
+        append iquery "<sIP>,[tmsh::get_field_value $obj server-name],[tmsh::get_name $obj],[tmsh::get_field_value $obj connect-state];"
+
+    }
+
+    # write all the data to the ifile stuff we setup in iapp
+    set dir [tmsh::pwd]
+    set fn <FILE>
+    catch {
+        set fh [open $fn w]
+        puts $fh "$host,$cdate"
+        puts $fh $selfs
+        puts $fh $iquery
+        close $fh
+    } {}
+
+    set sysIfile [iapp::conf modify sys file ifile /Common/<APP>.app/<APP>_iquery_sys_ifile source-path file:<FILE>]
+}
+# string map for adding variables to icall script
+set icall [string map [list <FILE> $tempFileLocation <sIP> $::main__self <APP> ${app}] $icall]
+# issue command to create icall script
+set icall [iapp::conf create sys icall script ${app}_iquery_script definition \{ $icall \}]
+# create icall hanlder to execute icall script
+set icall_update_handler [iapp::conf create sys icall handler periodic ${app}_iquery_update_handler \{ \
+    interval $::main__update_frequency \
+    first-occurrence $cdate \
+    script $icall \}]
+
+set 80_vs [iapp::conf create ltm virtual ${app}_iqdash_t${::main__port}_vs \
+    destination $::main__vip:$::main__port \
+    mask 255.255.255.255 \
+    ip-protocol tcp \
+    profiles replace-all-with \{ \
+        /Common/f5-tcp-progressive \{ \} \
+        /Common/http \{ \} \} \
+    rules \{ $irule \} ]
+
+
+
+iapp::template stop
+            }
+            macro {
+            }
+            presentation {
+
+section options {
+    choice display_help display "xlarge" default "hide"
+    optional ( options.display_help == "full" ) {
+        message display_help_max
+    }
+}
+
+section main {
+    message hello
+    string vip default "192.168.200.132" required validator "IpAddress" display "xlarge"
+    string port default "80" required validator "NonNegativeNumber" display "xlarge"
+    choice self display "xlarge" tcl {
+        set ::choices [iapp::get_items net self]
+        return [iapp::safe_display ::choices]
+    }
+    string update_frequency default "300" required validator "NonNegativeNumber"
+    optional ( options.display_help == "full" ) { message update_frequency_extra }
+}
+
+section todo {
+    message what
+    optional ( options.display_help == "full" ) {
+        message todo1
+        message todo2
+
+    }
+}
+
+text {
+    options "Template Options"
+    options.display_help "Do you want to see inline help or additional information?" {
+         "Yes, show inline help" => "full",
+         "No, do not show inline help" => "hide"
+    }
+    options.display_help_max "" "Inline help is available to provide contextual descriptions to aid in the completion of this configuration.  Select to show or hide the inline help in this template. Important notes and warnings are always visible, no matter which selection you make here."
+
+    main "iQuery Dashboard iapp"
+    main.hello "Introduction" "This iapp creates an iQuery dashboard showing iquery connection status and details to aid in troubleshooting"
+    main.vip "VIP"
+    main.update_frequency_extra "How often to update iquery status information?" "^^^Provide value in seconds: 300=5m, 3600=1hr, 28800=8hr"
+
+    todo "TODO list"
+    todo.what "" "List of 'to do' items so they can be tracked - Show inline help for more details"
+    todo.todo1 "todo 1" "Assume single self IP and append to beginning of each row? Or provide a list of selfIPs and let the user choose (include note about things to consider when choosing which IP would be used for iquery"
+    todo.todo2 "todo 2" "Create VS as a port of the self?"
+}
+            }
+            role-acl none
+            run-as none
+        }
+    }
+    description none
+    ignore-verification false
+    requires-bigip-version-max none
+    requires-bigip-version-min 14.1.0
+    requires-modules { ltm }
+    signing-key none
+    tmpl-checksum none
+    tmpl-signature none
+}
