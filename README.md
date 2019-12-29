@@ -7,7 +7,7 @@ For now, let's just stick with documenting what I've learned, what's been writte
 Basically, at it's core, if you can issue tmsh commands, you can write an iapp.
 
 
-iApps are based on TCL, TMOS is based in TCL, iRules are TCL.  ALL OF IT'S TCL!!!
+iApps are based on TCL, TMOS is based in TCL, iRules are TCL.
 
 ##############################################
 How do I currently write iapps?  A little about my setup
